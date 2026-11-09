@@ -1,0 +1,247 @@
+"""Isaac Lab 2.1.1 environment. Import after AppLauncher starts."""
+from __future__ import annotations
+
+from collections.abc import Sequence
+from pathlib import Path
+
+import omni.usd
+import torch
+from pxr import Usd, UsdPhysics
+
+import isaaclab.sim as sim_utils
+from isaaclab.assets import Articulation
+from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
+from isaaclab.scene import InteractiveSceneCfg
+from isaaclab.sensors import ContactSensor, RayCaster
+from isaaclab.sim import SimulationCfg
+from isaaclab.utils import configclass
+from isaaclab.utils.math import quat_apply
+
+from ..robot.jetbot_cfg import JetbotAssetCfg
+from ..scene.navigation_scene_cfg import FixedScene, define_parallel_scan_mesh
+from ..sensors.contact import make_obstacle_filter_paths
+from ..sensors.legacy211 import make_sensor_configs, make_articulation_cfg
+from .navigation_env_cfg import NavigationEnvCfg
+from .isaac_task_hooks import NavigationTaskHooks
+from .torch_mdp import goal_state, lidar_sectors
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+NAVIGATION_USD = PROJECT_ROOT / "assets" / "navigation_scene.usda"
+SCAN_MESH_PATH = "/World/NavigationScanMesh"
+
+
+@configclass
+class JetbotNavigationIsaacEnvCfg(DirectRLEnvCfg):
+    """Simulation and task settings."""
+
+    decimation = 4
+    episode_length_s = 120.0
+    action_space = 2
+    observation_space = 23
+    state_space = 0
+    seed = 42
+
+    sim: SimulationCfg = SimulationCfg(dt=1.0 / 120.0, render_interval=decimation)
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(
+        num_envs=1,
+        env_spacing=8.0,
+        replicate_physics=True,
+        filter_collisions=True,
+    )
+
+    navigation: NavigationEnvCfg = NavigationEnvCfg()
+    layout: FixedScene = FixedScene()
+    robot_usd: str | None = None
+    lidar_debug_vis: bool = False
+    contact_debug_vis: bool = False
+
+
+class JetbotNavigationIsaacEnv(DirectRLEnv):
+    """Jetbot navigation with batched physics and sensor data."""
+
+    cfg: JetbotNavigationIsaacEnvCfg
+
+    def __init__(self, cfg: JetbotNavigationIsaacEnvCfg, render_mode: str | None = None, **kwargs):
+        if abs(cfg.sim.dt - cfg.navigation.physics_dt) > 1.0e-12:
+            raise ValueError("SimulationCfg.dt must match NavigationEnvCfg.physics_dt")
+        if cfg.decimation != cfg.navigation.decimation:
+            raise ValueError("DirectRLEnv decimation must match the navigation contract")
+        cfg.layout.validate()
+        super().__init__(cfg, render_mode, **kwargs)
+
+        NavigationTaskHooks._initialize_navigation_buffers(self)
+
+    @staticmethod
+    def _env_regex_path(path: str) -> str:
+        prefix = "/World/envs/env_0"
+        if not path.startswith(prefix):
+            raise RuntimeError(f"expected body below {prefix}, received {path}")
+        return path.replace(prefix, "/World/envs/env_.*", 1)
+
+    def _setup_scene(self):
+        layout = self.cfg.layout
+        if not NAVIGATION_USD.is_file():
+            raise FileNotFoundError(
+                f"missing {NAVIGATION_USD}; run scripts.build_scene before launching Isaac Lab"
+            )
+
+        asset_cfg = JetbotAssetCfg()
+        robot_cfg = make_articulation_cfg(
+            prim_path="/World/envs/env_.*/Robot",
+            start=layout.start,
+            start_yaw=layout.start_yaw,
+            robot_usd=self.cfg.robot_usd,
+        )
+        self.robot = Articulation(robot_cfg)
+
+        room_cfg = sim_utils.UsdFileCfg(usd_path=str(NAVIGATION_USD))
+        room_cfg.func("/World/envs/env_0/Navigation", room_cfg)
+        goal_cfg = sim_utils.SphereCfg(
+            radius=self.cfg.navigation.goal_radius,
+            visual_material=sim_utils.PreviewSurfaceCfg(
+                diffuse_color=(0.05, 0.85, 0.15), emissive_color=(0.02, 0.25, 0.02)
+            ),
+        )
+        goal_cfg.func(
+            "/World/envs/env_0/Goal",
+            goal_cfg,
+            translation=(*layout.goal, self.cfg.navigation.goal_radius),
+        )
+
+        stage = omni.usd.get_context().get_stage()
+        robot_prim = stage.GetPrimAtPath("/World/envs/env_0/Robot")
+        rigid_paths = [
+            prim.GetPath().pathString
+            for prim in Usd.PrimRange(robot_prim, Usd.TraverseInstanceProxies())
+            if prim.HasAPI(UsdPhysics.RigidBodyAPI)
+        ]
+        resolved_local = asset_cfg.resolve_body_paths(rigid_paths)
+        self._resolved_body_paths = {
+            name: self._env_regex_path(path) for name, path in resolved_local.items()
+        }
+
+        ground_cfg = sim_utils.GroundPlaneCfg()
+        ground_cfg.func("/World/Ground", ground_cfg)
+        light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
+        light_cfg.func("/World/Light", light_cfg)
+
+        self.scene.clone_environments(copy_from_source=False)
+        self.scene.filter_collisions(global_prim_paths=["/World/Ground"])
+
+        # RayCaster uses one static mesh, so bake every translated room into it.
+        define_parallel_scan_mesh(stage, SCAN_MESH_PATH, self.scene.env_origins, layout)
+        obstacle_filters = make_obstacle_filter_paths(
+            "/World/envs/env_.*/Navigation/Obstacles",
+            (box.name for box in layout.boxes),
+        )
+        lidar_cfg, contact_cfgs = make_sensor_configs(
+            self.cfg.navigation,
+            self._resolved_body_paths["chassis"],
+            self._resolved_body_paths,
+            SCAN_MESH_PATH,
+            obstacle_filters,
+            debug_vis=self.cfg.lidar_debug_vis,
+        )
+        self.lidar = RayCaster(lidar_cfg)
+        self.contacts = {
+            name: ContactSensor(contact_cfg.replace(debug_vis=self.cfg.contact_debug_vis))
+            for name, contact_cfg in contact_cfgs.items()
+        }
+
+        self.scene.articulations["robot"] = self.robot
+        self.scene.sensors["lidar"] = self.lidar
+        for name, sensor in self.contacts.items():
+            self.scene.sensors[f"contact_{name}"] = sensor
+
+        self.sim.set_camera_view(eye=[6.0, -8.0, 8.0], target=[0.0, 0.0, 0.0])
+
+    def _pre_physics_step(self, actions: torch.Tensor) -> None:
+        return NavigationTaskHooks._pre_physics_step(self, actions)
+
+    def _apply_action(self) -> None:
+        self.robot.set_joint_velocity_target(self._wheel_targets, joint_ids=self._wheel_joint_ids)
+
+    def _lidar_distances(self) -> torch.Tensor:
+        hits = self.lidar.data.ray_hits_w
+        starts_b = self.lidar.ray_starts
+        quaternions = self.lidar.data.quat_w[:, None, :].expand(
+            -1, starts_b.shape[1], -1
+        )
+        starts_w = quat_apply(
+            quaternions.reshape(-1, 4), starts_b.reshape(-1, 3)
+        ).reshape_as(starts_b)
+        starts_w = starts_w + self.lidar.data.pos_w[:, None, :]
+        return torch.linalg.vector_norm(hits - starts_w, dim=-1)
+
+    def _navigation_state(self):
+        local_position = self.robot.data.root_pos_w[:, :2] - self.scene.env_origins[:, :2]
+        quaternion = self.robot.data.root_quat_w
+        w, x, y, z = quaternion.unbind(dim=-1)
+        yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y.square() + z.square()))
+        velocity = torch.stack(
+            (
+                self.robot.data.root_lin_vel_b[:, 0],
+                self.robot.data.root_ang_vel_b[:, 2],
+            ),
+            dim=-1,
+        )
+        distances = self._lidar_distances()
+        sectors = lidar_sectors(distances, self.cfg.navigation)
+        distance, sine, cosine = goal_state(local_position, yaw, self._goals_local)
+        return local_position, yaw, velocity, distances, sectors, distance, sine, cosine
+
+    def _contact_state(self):
+        body_force = []
+        for sensor in self.contacts.values():
+            history_proxy = sensor.data.force_matrix_w_history
+            if history_proxy is None:
+                raise RuntimeError(
+                    "filtered contact history is unavailable; verify obstacle rigid bodies and filters"
+                )
+            history = history_proxy
+            if history.numel() == 0:
+                raise RuntimeError(
+                    "filtered contact history is empty; verify obstacle rigid bodies and filters"
+                )
+            magnitude = torch.linalg.vector_norm(history, dim=-1)
+            body_force.append(magnitude.reshape(self.num_envs, -1).amax(dim=-1))
+        force = torch.stack(body_force, dim=-1)
+        collision = force.amax(dim=-1) > self.cfg.navigation.contact_threshold
+        return force, collision
+
+    def _get_observations(self) -> dict:
+        return NavigationTaskHooks._get_observations(self)
+
+    def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return NavigationTaskHooks._get_dones(self)
+
+    def _get_rewards(self) -> torch.Tensor:
+        return NavigationTaskHooks._get_rewards(self)
+
+    def _reset_idx(self, env_ids: Sequence[int] | None):
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, dtype=torch.int64, device=self.device)
+        super()._reset_idx(env_ids)
+
+        state = self.robot.data.default_root_state[env_ids].clone()
+        state[:, :3] += self.scene.env_origins[env_ids]
+        state[:, 7:] = 0.0
+        position = self.robot.data.default_joint_pos[env_ids].clone()
+        velocity = torch.zeros_like(self.robot.data.default_joint_vel[env_ids])
+        self.robot.write_root_pose_to_sim(state[:, :7], env_ids=env_ids)
+        self.robot.write_root_velocity_to_sim(state[:, 7:], env_ids=env_ids)
+        self.robot.write_joint_state_to_sim(position, velocity, env_ids=env_ids)
+        self.robot.set_joint_velocity_target(torch.zeros_like(velocity), env_ids=env_ids)
+
+        self._command_velocity[env_ids] = 0.0
+        self._previous_action[env_ids] = 0.0
+        self._applied_action[env_ids] = 0.0
+        self._wheel_targets[env_ids] = 0.0
+        start = torch.tensor(self.cfg.layout.start, dtype=torch.float32, device=self.device)
+        self._previous_distance[env_ids] = torch.linalg.vector_norm(
+            self._goals_local[env_ids] - start, dim=-1
+        )
+
+    def diagnostic_tensors(self) -> dict[str, torch.Tensor | dict[str, str]]:
+        return NavigationTaskHooks.diagnostic_tensors(self)

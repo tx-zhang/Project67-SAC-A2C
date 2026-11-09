@@ -1,0 +1,37 @@
+{
+  "sac_checkpoint_evaluation": {
+    "event": "evaluation",
+    "checkpoint_steps": 400000,
+    "success_rate": 0.0,
+    "mean_return": -20.490751266479492,
+    "episodes": 3,
+    "end_reasons": {
+      "1": 0,
+      "2": 0,
+      "3": 0,
+      "4": 3
+    }
+  },
+  "a2c_final_training_session": {
+    "event": "summary",
+    "timestamp_utc": "2026-10-22T21:07:49.574943+00:00",
+    "mode": "train",
+    "steps": 14348288,
+    "updates": 3503,
+    "session_steps": 14155776,
+    "episodes": 6286,
+    "end_reasons": {
+      "1": 3201,
+      "2": 0,
+      "3": 0,
+      "4": 3085
+    },
+    "recent_success_rate": 0.0,
+    "mean_return": -21.08918798446655,
+    "discarded_partial_rollout_transitions": 0,
+    "elapsed_seconds": 28802.6,
+    "stop_reason": "session_budget",
+    "reached_total_steps": false,
+    "completed_requested_run": true
+  }
+}

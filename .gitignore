@@ -1,0 +1,14 @@
+/.venv/
+/external/
+/.cache/
+/runs/
+/logs/
+/report/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+.env.*
+*.pt
+!models/sac-400000.pt
+!models/a2c-gsde-final.pt
